@@ -1,57 +1,114 @@
-import {BunRuntime} from "@effect/platform-bun";
-import {ConfigProvider, Effect, pipe, Schedule} from "effect";
-import {Telegram} from "./telegram/client.ts";
-import {click, getAccessToken, getProfile} from "./game/api.ts";
+import { BunRuntime } from '@effect/platform-bun'
+import chalk from 'chalk'
+import { Config, ConfigProvider, Effect, pipe, Schedule } from 'effect'
+import { constVoid } from 'effect/Function'
+import { click, getAccessToken, getProfile } from './game/api.ts'
+import { fmt } from './game/fmt.ts'
+import { Telegram } from './telegram/client.ts'
+
+type State = {
+	token: string
+	turbo: boolean
+	power: number
+	energy: number
+	balance: number
+}
 
 const miner = Effect.gen(function* (_) {
-    const client = yield* _(Telegram);
-    const peerId = yield* _(client.getPeerId('wormfare_slap_bot'));
+	const client = yield* _(Telegram)
+	const peerId = yield* _(client.getPeerId('wormfare_slap_bot'))
 
-    const webViewResultUrl = yield* _(client.requestWebView({
-        url: 'https://clicker.wormfare.com/',
-        bot: peerId,
-        peer: peerId
-    }));
+	const webViewResultUrl = yield* _(
+		client.requestWebView({
+			url: 'https://clicker.wormfare.com/',
+			bot: peerId,
+			peer: peerId,
+		})
+	)
 
-    const tgWebAppData = webViewResultUrl.searchParams.get('tgWebAppData')!
-    if (!tgWebAppData) {
-        return Effect.none
-    }
+	const tgWebAppData = webViewResultUrl.searchParams.get('tgWebAppData')!
+	if (!tgWebAppData) {
+		return Effect.none
+	}
 
-    const token = yield* getAccessToken(webViewResultUrl.searchParams.get('tgWebAppData')!);
+	const state: State = {
+		token: '',
+		turbo: false,
+		power: 0,
+		energy: 0,
+		balance: 0,
+	}
 
-    let profile = yield* getProfile(token)
+	const sync = Effect.gen(function* (_) {
+		state.token = yield* getAccessToken(tgWebAppData)
 
-    const now = Date.now();
-    const timeDiff = (now - profile.lastUpdateTimestamp) / 1000;
-    const energyGain = timeDiff * profile.energyPerSecond;
+		const result = yield* getProfile(state.token)
+		const timeDiff = (result.currentTimestamp - result.lastUpdateTimestamp) / 1000
+		const energyGain = timeDiff * result.energyPerSecond
 
-    let turbo = profile.isTurboAvailable
-    let energy = Math.min(profile.energyMax, profile.energyLeft + energyGain);
-    console.log("ENERGY:", energy)
+		state.turbo = result.isTurboAvailable
+		state.power = result.energyPerTap
+		state.energy = Math.min(result.energyMax, result.energyLeft + energyGain)
+		state.balance = result.score
+	})
 
-    while (Math.floor(energy) > 10 * profile.energyPerSecond) {
-        const count = Math.floor(Math.min(energy, profile.energyMax * 0.39));
+	const mine = Effect.gen(function* (_) {
+		const multiplier = yield* Config.number('GAME_TURBO_MULTIPLIER').pipe(Config.withDefault(300))
 
-        profile = yield* click(token, count, turbo)
-        turbo = profile.isTurboAvailable
-        energy = profile.energyLeft
+		const result = yield* click(state.token, (state.turbo ? multiplier : 1) * state.power, state.turbo)
+		const timeDiff = (result.currentTimestamp - result.lastUpdateTimestamp) / 1000
+		const energyGain = timeDiff * result.energyPerSecond
 
-        console.log("ENERGY:", profile.energyLeft)
+		const energyDiff = result.energyLeft - state.energy
+		const balanceDiff = result.score - state.balance
 
-        if (!turbo) {
-            yield* Effect.sleep((profile.energyLeft / 360) * 1000)
-        }
-    }
+		state.turbo = result.isTurboAvailable
+		state.power = result.energyPerTap
+		state.energy = Math.floor(Math.min(result.energyMax, result.energyLeft + energyGain))
+		state.balance = Math.floor(result.score)
 
-    console.log("CIRCLE FINISHED...")
+		console.log(
+			chalk.bold(new Date().toLocaleTimeString()),
+			'|⚡️'.padEnd(4),
+			chalk.bold(`${state.energy}`.padEnd(4)),
+			chalk.bold[energyDiff > 0 ? 'green' : 'red'](fmt(energyDiff).padEnd(4)),
+			'|🪙'.padEnd(4),
+			chalk.bold(fmt(state.balance).slice(1).padEnd(8)),
+			chalk.bold[balanceDiff > 0 ? 'green' : 'red'](fmt(balanceDiff).padEnd(4))
+		)
+	})
+
+	const mineInterval = yield* Config.duration('GAME_MINE_INTERVAL').pipe(Config.withDefault('1 seconds'))
+	const syncInterval = yield* Config.duration('GAME_SYNC_INTERVAL').pipe(Config.withDefault('60 seconds'))
+
+	const miner = Effect.repeat(
+		mine,
+		Schedule.addDelay(Schedule.forever, () => mineInterval)
+	)
+
+	const syncer = Effect.repeat(
+		sync,
+		Schedule.addDelay(Schedule.forever, () => syncInterval)
+	)
+
+	yield* sync
+	yield* Effect.all([miner, syncer], { concurrency: 'unbounded' })
 })
 
-const policy = Schedule.addDelay(Schedule.forever, () => "5 minutes")
+const policy = Schedule.addDelay(Schedule.forever, () => '15 seconds')
+
+const program = Effect.match(miner, {
+	onSuccess: constVoid,
+	onFailure: (err) => {
+		console.error(chalk.bold(new Date().toLocaleTimeString()), '‼️FAILED:', err._tag)
+	},
+})
 
 pipe(
-    Effect.repeat(miner, policy),
-    Effect.provide(Telegram.live),
-    Effect.withConfigProvider(ConfigProvider.fromEnv()),
-    BunRuntime.runMain
+	Effect.all([Effect.repeat(program, policy), Effect.sync(() => process.stdout.write('\u001Bc\u001B[3J'))], {
+		concurrency: 'unbounded',
+	}),
+	Effect.provide(Telegram.live),
+	Effect.withConfigProvider(ConfigProvider.fromEnv()),
+	BunRuntime.runMain
 )
